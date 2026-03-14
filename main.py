@@ -18,7 +18,7 @@ app = FastAPI(title="Order Flow API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "https://orderflow-frontend.vercel.app",
+    ""https://orderflow-frontend-sigma.vercel.app",",
     "http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
