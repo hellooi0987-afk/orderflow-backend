@@ -8,18 +8,3 @@
     "restartPolicyMaxRetries": 3
   }
 }
-```
-
-4. Click **Commit changes**
-
----
-
-Actually the cleanest fix is to just **delete `railway.json` entirely** and put back the `Procfile` — that's simpler and less error-prone:
-
-## Simplest fix — delete railway.json, restore Procfile
-
-**Step 1** — Click `railway.json` → click the **trash icon** → Commit changes
-
-**Step 2** — Click **Add file → Create new file** → name it `Procfile` (no extension) → paste exactly:
-```
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
