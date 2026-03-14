@@ -1,8 +1,3 @@
-"""
-XAUUSD Order Flow Analysis Backend
-FastAPI + Dukascopy data source
-"""
-
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -10,16 +5,13 @@ import struct
 import lzma
 import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 import math
 
 app = FastAPI(title="Order Flow API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-    ""https://orderflow-frontend-sigma.vercel.app",",
-    "http://localhost:5173"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
