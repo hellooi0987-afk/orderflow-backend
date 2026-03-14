@@ -16,8 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Dukascopy helpers ──────────────────────────────────────────────────────
-
 DUKA_BASE = "https://datafeed.dukascopy.com/datafeed"
 
 INSTRUMENT_MAP = {
@@ -27,28 +25,33 @@ INSTRUMENT_MAP = {
     "USDJPY": "USDJPY",
 }
 
-async def fetch_dukascopy_candles(symbol: str, year: int, month: int, day: int, hour: int) -> list[dict]:
-    """
-    Fetch 1-minute OHLCV candles from Dukascopy for a specific hour.
-    Returns list of {time, open, high, low, close, volume}
-    """
-    # Dukascopy uses 0-based months
-    url = f"{DUKA_BASE}/{symbol}/{year:04d}/{(month-1):02d}/{day:02d}/{hour:02d}h_ticks.bi5"
 
+def get_last_trading_hours(hours_back):
+    """Return trading hours skipping weekends, going back as far as needed."""
+    now = datetime.now(timezone.utc)
+    hours = []
+    offset = 1
+    while len(hours) < hours_back and offset < 300:
+        target = now - timedelta(hours=offset)
+        if target.weekday() < 5:  # Mon=0 ... Fri=4, skip Sat=5 Sun=6
+            hours.append((target.year, target.month, target.day, target.hour))
+        offset += 1
+    return hours
+
+
+async def fetch_dukascopy_candles(symbol, year, month, day, hour):
+    url = f"{DUKA_BASE}/{symbol}/{year:04d}/{(month-1):02d}/{day:02d}/{hour:02d}h_ticks.bi5"
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
             return []
-
     raw = lzma.decompress(resp.content)
-
     ticks = []
-    tick_size = 20  # Dukascopy tick: 4+4+4+4+4 bytes = 20 bytes
+    tick_size = 20
     for i in range(0, len(raw) - tick_size + 1, tick_size):
         chunk = raw[i:i + tick_size]
         ms_offset, ask_raw, bid_raw, ask_vol, bid_vol = struct.unpack(">IIIff", chunk)
         ts = datetime(year, month, day, hour, tzinfo=timezone.utc) + timedelta(milliseconds=ms_offset)
-        # For gold: price divisor is 100000 for most Dukascopy pairs; XAUUSD uses 1000
         divisor = 1000.0 if symbol == "XAUUSD" else 100000.0
         mid = (ask_raw + bid_raw) / 2 / divisor
         ticks.append({
@@ -57,16 +60,13 @@ async def fetch_dukascopy_candles(symbol: str, year: int, month: int, day: int, 
             "ask_vol": float(ask_vol),
             "bid_vol": float(bid_vol),
         })
-
     return ticks
 
 
-def ticks_to_candles(ticks: list[dict], tf_seconds: int = 60) -> list[dict]:
-    """Aggregate ticks into OHLCV candles."""
+def ticks_to_candles(ticks, tf_seconds=60):
     if not ticks:
         return []
-
-    candles: dict[int, dict] = {}
+    candles = {}
     for t in ticks:
         bucket = int(t["ts"].timestamp() // tf_seconds) * tf_seconds
         if bucket not in candles:
@@ -87,68 +87,41 @@ def ticks_to_candles(ticks: list[dict], tf_seconds: int = 60) -> list[dict]:
         c["volume"] += t["ask_vol"] + t["bid_vol"]
         c["buy_vol"] += t["ask_vol"]
         c["sell_vol"] += t["bid_vol"]
-
     return sorted(candles.values(), key=lambda x: x["time"])
 
 
-# ─── Order flow calculations ────────────────────────────────────────────────
-
-def compute_volume_delta(candles: list[dict]) -> list[dict]:
-    """
-    Compute volume delta (buy pressure - sell pressure) per candle.
-    Also compute cumulative delta.
-    """
+def compute_volume_delta(candles):
     cum_delta = 0.0
     result = []
     for c in candles:
         delta = c["buy_vol"] - c["sell_vol"]
         cum_delta += delta
-        result.append({
-            **c,
-            "delta": round(delta, 4),
-            "cum_delta": round(cum_delta, 4),
-        })
+        result.append({**c, "delta": round(delta, 4), "cum_delta": round(cum_delta, 4)})
     return result
 
 
-def compute_volume_profile(candles: list[dict], pip_size: float = 0.5) -> list[dict]:
-    """
-    Build a volume profile: volume traded at each price level.
-    pip_size = bucket width in price units (0.5 for gold = 50 cents).
-    """
-    profile: dict[float, float] = {}
+def compute_volume_profile(candles, pip_size=0.5):
+    profile = {}
     for c in candles:
-        # Distribute candle volume across price range proportionally
         lo_bucket = math.floor(c["low"] / pip_size) * pip_size
         hi_bucket = math.floor(c["high"] / pip_size) * pip_size
-        price = lo_bucket
         num_buckets = max(1, round((hi_bucket - lo_bucket) / pip_size) + 1)
         vol_per_bucket = c["volume"] / num_buckets
+        price = lo_bucket
         while price <= hi_bucket + 0.001:
             key = round(price, 2)
             profile[key] = profile.get(key, 0) + vol_per_bucket
             price = round(price + pip_size, 2)
-
     if not profile:
         return []
-
     max_vol = max(profile.values())
-    result = [
-        {
-            "price": p,
-            "volume": round(v, 4),
-            "pct": round(v / max_vol * 100, 1),
-        }
+    return [
+        {"price": p, "volume": round(v, 4), "pct": round(v / max_vol * 100, 1)}
         for p, v in sorted(profile.items())
     ]
-    return result
 
 
-def detect_volume_spikes(candles: list[dict], window: int = 20, multiplier: float = 2.0) -> list[dict]:
-    """
-    Flag candles where volume > multiplier × rolling average.
-    Returns enriched candles with spike flag and avg_vol reference.
-    """
+def detect_volume_spikes(candles, window=20, multiplier=2.0):
     result = []
     for i, c in enumerate(candles):
         start = max(0, i - window)
@@ -164,17 +137,11 @@ def detect_volume_spikes(candles: list[dict], window: int = 20, multiplier: floa
     return result
 
 
-def find_poc_and_value_area(profile: list[dict], value_area_pct: float = 0.70) -> dict:
-    """
-    Find Point of Control (POC) and Value Area (70% of total volume).
-    """
+def find_poc_and_value_area(profile, value_area_pct=0.70):
     if not profile:
         return {}
-
     total_vol = sum(p["volume"] for p in profile)
     poc = max(profile, key=lambda x: x["volume"])
-
-    # Value area: expand from POC until 70% of total volume is covered
     sorted_by_vol = sorted(profile, key=lambda x: x["volume"], reverse=True)
     covered = 0.0
     va_prices = []
@@ -183,17 +150,14 @@ def find_poc_and_value_area(profile: list[dict], value_area_pct: float = 0.70) -
         va_prices.append(level["price"])
         if covered >= total_vol * value_area_pct:
             break
-
     return {
         "poc": poc["price"],
         "poc_volume": round(poc["volume"], 4),
-        "vah": round(max(va_prices), 2),  # Value Area High
-        "val": round(min(va_prices), 2),  # Value Area Low
+        "vah": round(max(va_prices), 2),
+        "val": round(min(va_prices), 2),
         "total_volume": round(total_vol, 4),
     }
 
-
-# ─── Routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health():
@@ -204,27 +168,17 @@ async def health():
 async def get_order_flow(
     symbol: str,
     hours_back: int = Query(default=3, ge=1, le=12),
-    timeframe: int = Query(default=60, description="Candle size in seconds"),
+    timeframe: int = Query(default=60),
     spike_window: int = Query(default=20),
     spike_multiplier: float = Query(default=2.0),
     profile_pip_size: float = Query(default=0.5),
 ):
-    """
-    Main endpoint: returns volume delta, volume profile, and spike detection
-    for the requested symbol over the last N hours.
-    """
     symbol = symbol.upper()
     if symbol not in INSTRUMENT_MAP:
         return {"error": f"Unknown symbol. Supported: {list(INSTRUMENT_MAP.keys())}"}
 
-    now = datetime.now(timezone.utc)
-    all_ticks: list[dict] = []
-
-    # Fetch each hour in parallel
-    hours = []
-    for h in range(hours_back):
-        target = now - timedelta(hours=h + 1)
-        hours.append((target.year, target.month, target.day, target.hour))
+    hours = get_last_trading_hours(hours_back)
+    all_ticks = []
 
     async def fetch_hour(args):
         y, mo, d, hr = args
@@ -240,33 +194,27 @@ async def get_order_flow(
     all_ticks.sort(key=lambda x: x["ts"])
 
     if not all_ticks:
-        return {"error": "No data returned from Dukascopy. Try a different time range or check if markets are open."}
+        return {"error": "No data found. Dukascopy may not have data for this period yet."}
 
-    # Build candles
+    now = datetime.now(timezone.utc)
     candles = ticks_to_candles(all_ticks, tf_seconds=timeframe)
-
-    # Compute order flow metrics
     candles_with_delta = compute_volume_delta(candles)
     candles_with_spikes = detect_volume_spikes(candles_with_delta, window=spike_window, multiplier=spike_multiplier)
-
-    # Volume profile
     profile = compute_volume_profile(candles, pip_size=profile_pip_size)
     poc_info = find_poc_and_value_area(profile)
 
-    # Summary stats
     spikes = [c for c in candles_with_spikes if c["is_spike"]]
-    deltas = [c["delta"] for c in candles_with_delta]
-    net_delta = sum(deltas)
-    bias = "bullish" if net_delta > 0 else "bearish"
+    net_delta = sum(c["delta"] for c in candles_with_delta)
 
     return {
         "symbol": symbol,
         "generated_at": now.isoformat(),
         "candle_count": len(candles),
         "timeframe_seconds": timeframe,
+        "data_from": "last trading session (weekend-aware)",
         "summary": {
             "net_delta": round(net_delta, 4),
-            "bias": bias,
+            "bias": "bullish" if net_delta > 0 else "bearish",
             "spike_count": len(spikes),
             "last_price": candles[-1]["close"] if candles else None,
             **poc_info,
