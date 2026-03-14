@@ -1,5 +1,4 @@
 {
-  "$schema": "https://railway.app/railway.schema.json",
   "build": {
     "builder": "NIXPACKS"
   },
@@ -13,12 +12,14 @@
 
 4. Click **Commit changes**
 
-## Step 3 — Watch Railway redeploy
+---
 
-Go to [railway.com](https://railway.com) → your project → click your service → click the **Deployments** tab. You'll see a new deployment triggered automatically. Wait about 60 seconds for it to go green.
+Actually the cleanest fix is to just **delete `railway.json` entirely** and put back the `Procfile` — that's simpler and less error-prone:
 
-## Step 4 — Test the backend directly
+## Simplest fix — delete railway.json, restore Procfile
 
-Once it shows success, open this URL in your browser:
+**Step 1** — Click `railway.json` → click the **trash icon** → Commit changes
+
+**Step 2** — Click **Add file → Create new file** → name it `Procfile` (no extension) → paste exactly:
 ```
-https://web-production-5a8b.up.railway.app/api/health
+web: uvicorn main:app --host 0.0.0.0 --port $PORT
