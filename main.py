@@ -1,256 +1,291 @@
+"""
+XAUUSD Order Flow Analysis Backend
+FastAPI + Dukascopy data source
+"""
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import httpx, struct, lzma, asyncio, math
+import httpx
+import struct
+import lzma
+import asyncio
 from datetime import datetime, timezone, timedelta
+from typing import Optional
+import math
 
 app = FastAPI(title="Order Flow API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Dukascopy helpers ──────────────────────────────────────────────────────
 
 DUKA_BASE = "https://datafeed.dukascopy.com/datafeed"
 
 INSTRUMENT_MAP = {
-    "XAUUSD":    "XAUUSD",
-    "XAGUSD":    "XAGUSD",
-    "USOUSD":    "WTICMDUSD",
-    "BRTUSD":    "BRENTCMDUSD",
-    "NATGASUSD": "NATGASUSD",
-    "EURUSD":    "EURUSD",
-    "GBPUSD":    "GBPUSD",
-    "USDJPY":    "USDJPY",
-    "BTCUSD":    "BTCUSD",
-    "SPXUSD":    "SPX500",
-    "NDXUSD":    "NAS100",
+    "XAUUSD": "XAUUSD",
+    "EURUSD": "EURUSD",
+    "GBPUSD": "GBPUSD",
+    "USDJPY": "USDJPY",
 }
 
-DIVISORS = {
-    "XAUUSD": 1000.0, "XAGUSD": 1000.0, "WTICMDUSD": 1000.0,
-    "BRENTCMDUSD": 1000.0, "NATGASUSD": 10000.0,
-    "EURUSD": 100000.0, "GBPUSD": 100000.0, "USDJPY": 1000.0,
-    "BTCUSD": 1.0, "SPX500": 1000.0, "NAS100": 1000.0,
-}
+async def fetch_dukascopy_candles(symbol: str, year: int, month: int, day: int, hour: int) -> list[dict]:
+    """
+    Fetch 1-minute OHLCV candles from Dukascopy for a specific hour.
+    Returns list of {time, open, high, low, close, volume}
+    """
+    # Dukascopy uses 0-based months
+    url = f"{DUKA_BASE}/{symbol}/{year:04d}/{(month-1):02d}/{day:02d}/{hour:02d}h_ticks.bi5"
 
-def get_session(epoch):
-    h = datetime.utcfromtimestamp(epoch).hour
-    if 13 <= h < 16: return "overlap"
-    if 7  <= h < 13: return "london"
-    if 13 <= h < 21: return "ny"
-    if 0  <= h <  7: return "asia"
-    return "off"
-
-def get_last_trading_hours(hours_back):
-    now, hours, offset = datetime.now(timezone.utc), [], 1
-    while len(hours) < hours_back and offset < 300:
-        t = now - timedelta(hours=offset)
-        if t.weekday() < 5:
-            hours.append((t.year, t.month, t.day, t.hour))
-        offset += 1
-    return hours
-
-async def fetch_raw_ticks(duka_sym, year, month, day, hour):
-    url = f"{DUKA_BASE}/{duka_sym}/{year:04d}/{(month-1):02d}/{day:02d}/{hour:02d}h_ticks.bi5"
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200: return []
-    div = DIVISORS.get(duka_sym, 100000.0)
-    raw = lzma.decompress(r.content)
+        resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            return []
+
+    raw = lzma.decompress(resp.content)
+
     ticks = []
-    for i in range(0, len(raw) - 19, 20):
-        ms, ask_r, bid_r, av, bv = struct.unpack(">IIIff", raw[i:i+20])
-        ts = datetime(year, month, day, hour, tzinfo=timezone.utc) + timedelta(milliseconds=ms)
+    tick_size = 20  # Dukascopy tick: 4+4+4+4+4 bytes = 20 bytes
+    for i in range(0, len(raw) - tick_size + 1, tick_size):
+        chunk = raw[i:i + tick_size]
+        ms_offset, ask_raw, bid_raw, ask_vol, bid_vol = struct.unpack(">IIIff", chunk)
+        ts = datetime(year, month, day, hour, tzinfo=timezone.utc) + timedelta(milliseconds=ms_offset)
+        # For gold: price divisor is 100000 for most Dukascopy pairs; XAUUSD uses 1000
+        divisor = 1000.0 if symbol == "XAUUSD" else 100000.0
+        mid = (ask_raw + bid_raw) / 2 / divisor
         ticks.append({
             "ts": ts,
-            "price": (ask_r + bid_r) / 2 / div,
-            "ask_vol": float(av),
-            "bid_vol": float(bv),
+            "price": mid,
+            "ask_vol": float(ask_vol),
+            "bid_vol": float(bid_vol),
         })
+
     return ticks
 
-def ticks_to_candles(ticks, tf_seconds=60):
-    if not ticks: return []
-    candles = {}
+
+def ticks_to_candles(ticks: list[dict], tf_seconds: int = 60) -> list[dict]:
+    """Aggregate ticks into OHLCV candles."""
+    if not ticks:
+        return []
+
+    candles: dict[int, dict] = {}
     for t in ticks:
-        b = int(t["ts"].timestamp() // tf_seconds) * tf_seconds
-        if b not in candles:
-            candles[b] = {
-                "time": b, "open": t["price"], "high": t["price"],
-                "low":  t["price"], "close": t["price"],
-                "volume": 0.0, "buy_vol": 0.0, "sell_vol": 0.0,
-                "session": get_session(b),
+        bucket = int(t["ts"].timestamp() // tf_seconds) * tf_seconds
+        if bucket not in candles:
+            candles[bucket] = {
+                "time": bucket,
+                "open": t["price"],
+                "high": t["price"],
+                "low": t["price"],
+                "close": t["price"],
+                "volume": 0.0,
+                "buy_vol": 0.0,
+                "sell_vol": 0.0,
             }
-        c = candles[b]
-        c["high"]    = max(c["high"], t["price"])
-        c["low"]     = min(c["low"],  t["price"])
-        c["close"]   = t["price"]
-        c["volume"]  += t["ask_vol"] + t["bid_vol"]
+        c = candles[bucket]
+        c["high"] = max(c["high"], t["price"])
+        c["low"] = min(c["low"], t["price"])
+        c["close"] = t["price"]
+        c["volume"] += t["ask_vol"] + t["bid_vol"]
         c["buy_vol"] += t["ask_vol"]
-        c["sell_vol"]+= t["bid_vol"]
+        c["sell_vol"] += t["bid_vol"]
+
     return sorted(candles.values(), key=lambda x: x["time"])
 
-def compute_volume_delta(candles):
-    cum, out = 0.0, []
+
+# ─── Order flow calculations ────────────────────────────────────────────────
+
+def compute_volume_delta(candles: list[dict]) -> list[dict]:
+    """
+    Compute volume delta (buy pressure - sell pressure) per candle.
+    Also compute cumulative delta.
+    """
+    cum_delta = 0.0
+    result = []
     for c in candles:
-        d = c["buy_vol"] - c["sell_vol"]
-        cum += d
-        out.append({**c, "delta": round(d, 4), "cum_delta": round(cum, 4)})
-    return out
+        delta = c["buy_vol"] - c["sell_vol"]
+        cum_delta += delta
+        result.append({
+            **c,
+            "delta": round(delta, 4),
+            "cum_delta": round(cum_delta, 4),
+        })
+    return result
 
-def compute_volume_profile(candles, pip_size=0.5):
-    profile = {}
+
+def compute_volume_profile(candles: list[dict], pip_size: float = 0.5) -> list[dict]:
+    """
+    Build a volume profile: volume traded at each price level.
+    pip_size = bucket width in price units (0.5 for gold = 50 cents).
+    """
+    profile: dict[float, float] = {}
     for c in candles:
-        lo = math.floor(c["low"] / pip_size) * pip_size
-        hi = math.floor(c["high"] / pip_size) * pip_size
-        n  = max(1, round((hi - lo) / pip_size) + 1)
-        vpb = c["volume"] / n
-        p = lo
-        while p <= hi + 0.001:
-            k = round(p, 2)
-            profile[k] = profile.get(k, 0) + vpb
-            p = round(p + pip_size, 2)
-    if not profile: return []
-    mv = max(profile.values())
-    return [{"price": p, "volume": round(v, 4), "pct": round(v / mv * 100, 1)}
-            for p, v in sorted(profile.items())]
+        # Distribute candle volume across price range proportionally
+        lo_bucket = math.floor(c["low"] / pip_size) * pip_size
+        hi_bucket = math.floor(c["high"] / pip_size) * pip_size
+        price = lo_bucket
+        num_buckets = max(1, round((hi_bucket - lo_bucket) / pip_size) + 1)
+        vol_per_bucket = c["volume"] / num_buckets
+        while price <= hi_bucket + 0.001:
+            key = round(price, 2)
+            profile[key] = profile.get(key, 0) + vol_per_bucket
+            price = round(price + pip_size, 2)
 
-def detect_volume_spikes(candles, window=20, mult=2.0):
-    out = []
+    if not profile:
+        return []
+
+    max_vol = max(profile.values())
+    result = [
+        {
+            "price": p,
+            "volume": round(v, 4),
+            "pct": round(v / max_vol * 100, 1),
+        }
+        for p, v in sorted(profile.items())
+    ]
+    return result
+
+
+def detect_volume_spikes(candles: list[dict], window: int = 20, multiplier: float = 2.0) -> list[dict]:
+    """
+    Flag candles where volume > multiplier × rolling average.
+    Returns enriched candles with spike flag and avg_vol reference.
+    """
+    result = []
     for i, c in enumerate(candles):
-        vols = [x["volume"] for x in candles[max(0, i - window):i]]
-        avg  = sum(vols) / len(vols) if vols else 0
-        spike = avg > 0 and c["volume"] > mult * avg
-        out.append({**c, "avg_vol": round(avg, 4), "is_spike": spike,
-                    "spike_ratio": round(c["volume"] / avg, 2) if avg > 0 else 0})
-    return out
+        start = max(0, i - window)
+        window_vols = [x["volume"] for x in candles[start:i]]
+        avg_vol = sum(window_vols) / len(window_vols) if window_vols else 0
+        is_spike = avg_vol > 0 and c["volume"] > multiplier * avg_vol
+        result.append({
+            **c,
+            "avg_vol": round(avg_vol, 4),
+            "is_spike": is_spike,
+            "spike_ratio": round(c["volume"] / avg_vol, 2) if avg_vol > 0 else 0,
+        })
+    return result
 
-def detect_delta_divergence(candles, lookback=5):
-    out = []
-    for i, c in enumerate(candles):
-        div, strength = None, 0.0
-        if i >= lookback:
-            w  = candles[i - lookback:i + 1]
-            pp = [x["close"] for x in w]
-            dp = [x["cum_delta"] for x in w]
-            php, phd = max(pp[:-1]), max(dp[:-1])
-            plp, pld = min(pp[:-1]), min(dp[:-1])
-            cp, cd = c["close"], c["cum_delta"]
-            if cp > php and cd < phd:
-                strength = round(min(100, ((cp-php)/(php+1e-9) + (phd-cd)/(abs(phd)+1e-9)) * 50), 1)
-                div = "bearish"
-            elif cp < plp and cd > pld:
-                strength = round(min(100, ((plp-cp)/(plp+1e-9) + (cd-pld)/(abs(pld)+1e-9)) * 50), 1)
-                div = "bullish"
-        out.append({**c, "divergence": div, "divergence_strength": strength})
-    return out
 
-def detect_absorption(candles, vw=20, vm=1.8, rt=0.35):
-    out = []
-    for i, c in enumerate(candles):
-        ab = False
-        if i >= vw:
-            win = candles[i - vw:i]
-            av = sum(x["volume"] for x in win) / len(win)
-            ar = sum(x["high"] - x["low"] for x in win) / len(win)
-            ab = av > 0 and c["volume"] > vm * av and ar > 0 and (c["high"] - c["low"]) < rt * ar
-        out.append({**c, "is_absorption": ab})
-    return out
+def find_poc_and_value_area(profile: list[dict], value_area_pct: float = 0.70) -> dict:
+    """
+    Find Point of Control (POC) and Value Area (70% of total volume).
+    """
+    if not profile:
+        return {}
 
-def find_poc_and_value_area(profile, pct=0.70):
-    if not profile: return {}
-    tv  = sum(p["volume"] for p in profile)
+    total_vol = sum(p["volume"] for p in profile)
     poc = max(profile, key=lambda x: x["volume"])
-    sv  = sorted(profile, key=lambda x: x["volume"], reverse=True)
-    cov, vp = 0.0, []
-    for lvl in sv:
-        cov += lvl["volume"]; vp.append(lvl["price"])
-        if cov >= tv * pct: break
-    return {"poc": poc["price"], "poc_volume": round(poc["volume"], 4),
-            "vah": round(max(vp), 2), "val": round(min(vp), 2),
-            "total_volume": round(tv, 4)}
 
-def compute_session_stats(candles):
-    stats = {}
-    for c in candles:
-        s = c.get("session", "off")
-        if s not in stats: stats[s] = {"volume": 0.0, "delta": 0.0, "candles": 0, "spikes": 0}
-        stats[s]["volume"]  += c.get("volume", 0)
-        stats[s]["delta"]   += c.get("delta", 0)
-        stats[s]["candles"] += 1
-        if c.get("is_spike"): stats[s]["spikes"] += 1
-    return {k: {x: round(v, 4) if isinstance(v, float) else v for x, v in d.items()}
-            for k, d in stats.items()}
+    # Value area: expand from POC until 70% of total volume is covered
+    sorted_by_vol = sorted(profile, key=lambda x: x["volume"], reverse=True)
+    covered = 0.0
+    va_prices = []
+    for level in sorted_by_vol:
+        covered += level["volume"]
+        va_prices.append(level["price"])
+        if covered >= total_vol * value_area_pct:
+            break
+
+    return {
+        "poc": poc["price"],
+        "poc_volume": round(poc["volume"], 4),
+        "vah": round(max(va_prices), 2),  # Value Area High
+        "val": round(min(va_prices), 2),  # Value Area Low
+        "total_volume": round(total_vol, 4),
+    }
+
+
+# ─── Routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
+
 @app.get("/api/orderflow/{symbol}")
 async def get_order_flow(
-    symbol:              str,
-    hours_back:          int   = Query(default=3, ge=1, le=12),
-    timeframe:           int   = Query(default=60),
-    spike_window:        int   = Query(default=20),
-    spike_multiplier:    float = Query(default=2.0),
-    profile_pip_size:    float = Query(default=0.5),
-    divergence_lookback: int   = Query(default=5),
+    symbol: str,
+    hours_back: int = Query(default=3, ge=1, le=12),
+    timeframe: int = Query(default=60, description="Candle size in seconds"),
+    spike_window: int = Query(default=20),
+    spike_multiplier: float = Query(default=2.0),
+    profile_pip_size: float = Query(default=0.5),
 ):
+    """
+    Main endpoint: returns volume delta, volume profile, and spike detection
+    for the requested symbol over the last N hours.
+    """
     symbol = symbol.upper()
     if symbol not in INSTRUMENT_MAP:
         return {"error": f"Unknown symbol. Supported: {list(INSTRUMENT_MAP.keys())}"}
 
-    duka_sym  = INSTRUMENT_MAP[symbol]
-    hours     = get_last_trading_hours(hours_back)
-    all_ticks = []
+    now = datetime.now(timezone.utc)
+    all_ticks: list[dict] = []
 
-    async def fh(args):
+    # Fetch each hour in parallel
+    hours = []
+    for h in range(hours_back):
+        target = now - timedelta(hours=h + 1)
+        hours.append((target.year, target.month, target.day, target.hour))
+
+    async def fetch_hour(args):
         y, mo, d, hr = args
-        try: return await fetch_raw_ticks(duka_sym, y, mo, d, hr)
-        except: return []
+        try:
+            return await fetch_dukascopy_candles(symbol, y, mo, d, hr)
+        except Exception:
+            return []
 
-    for r in await asyncio.gather(*[fh(h) for h in hours]):
+    results = await asyncio.gather(*[fetch_hour(h) for h in hours])
+    for r in results:
         all_ticks.extend(r)
+
     all_ticks.sort(key=lambda x: x["ts"])
 
     if not all_ticks:
-        return {"error": "No data found. Markets may be closed — try again Monday."}
+        return {"error": "No data returned from Dukascopy. Try a different time range or check if markets are open."}
 
-    now     = datetime.now(timezone.utc)
+    # Build candles
     candles = ticks_to_candles(all_ticks, tf_seconds=timeframe)
-    candles = compute_volume_delta(candles)
-    candles = detect_volume_spikes(candles, window=spike_window, multiplier=spike_multiplier)
-    candles = detect_delta_divergence(candles, lookback=divergence_lookback)
-    candles = detect_absorption(candles)
 
-    profile    = compute_volume_profile(candles, pip_size=profile_pip_size)
-    poc_info   = find_poc_and_value_area(profile)
-    sess_stats = compute_session_stats(candles)
+    # Compute order flow metrics
+    candles_with_delta = compute_volume_delta(candles)
+    candles_with_spikes = detect_volume_spikes(candles_with_delta, window=spike_window, multiplier=spike_multiplier)
 
-    spikes    = [c for c in candles if c["is_spike"]]
-    divs      = [c for c in candles if c["divergence"]]
-    absorbs   = [c for c in candles if c["is_absorption"]]
-    net_delta = sum(c["delta"] for c in candles)
+    # Volume profile
+    profile = compute_volume_profile(candles, pip_size=profile_pip_size)
+    poc_info = find_poc_and_value_area(profile)
+
+    # Summary stats
+    spikes = [c for c in candles_with_spikes if c["is_spike"]]
+    deltas = [c["delta"] for c in candles_with_delta]
+    net_delta = sum(deltas)
+    bias = "bullish" if net_delta > 0 else "bearish"
 
     return {
-        "symbol":            symbol,
-        "generated_at":      now.isoformat(),
-        "candle_count":      len(candles),
+        "symbol": symbol,
+        "generated_at": now.isoformat(),
+        "candle_count": len(candles),
         "timeframe_seconds": timeframe,
-        "data_from":         "last trading session (weekend-aware)",
         "summary": {
-            "net_delta":        round(net_delta, 4),
-            "bias":             "bullish" if net_delta > 0 else "bearish",
-            "spike_count":      len(spikes),
-            "divergence_count": len(divs),
-            "absorption_count": len(absorbs),
-            "last_price":       candles[-1]["close"] if candles else None,
+            "net_delta": round(net_delta, 4),
+            "bias": bias,
+            "spike_count": len(spikes),
+            "last_price": candles[-1]["close"] if candles else None,
             **poc_info,
         },
-        "session_stats":  sess_stats,
-        "candles":        candles,
+        "candles": candles_with_spikes,
         "volume_profile": profile,
     }
+
 
 @app.get("/api/symbols")
 async def list_symbols():
     return {"symbols": list(INSTRUMENT_MAP.keys())}
+
 
 if __name__ == "__main__":
     import uvicorn
