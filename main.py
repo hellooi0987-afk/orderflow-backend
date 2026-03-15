@@ -29,7 +29,7 @@ DIVISORS = {
     "BTCUSD": 1.0, "SPX500": 1000.0, "NAS100": 1000.0,
 }
 
-# ── Session helper ───────────────────────────────────────────────────────────
+# ── Session helper ────────────────────────────────────────────────────────────
 def get_session(epoch):
     h = datetime.utcfromtimestamp(epoch).hour
     if 13 <= h < 16: return "overlap"
@@ -38,7 +38,7 @@ def get_session(epoch):
     if 0  <= h <  7: return "asia"
     return "off"
 
-# ── Dukascopy fetch ──────────────────────────────────────────────────────────
+# ── Dukascopy fetch ───────────────────────────────────────────────────────────
 def get_last_trading_hours(hours_back):
     now, hours, offset = datetime.now(timezone.utc), [], 1
     while len(hours) < hours_back and offset < 300:
@@ -53,22 +53,22 @@ async def fetch_raw_ticks(duka_sym, year, month, day, hour):
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200: return []
-    raw = lzma.decompress(r.content)
     div = DIVISORS.get(duka_sym, 100000.0)
+    raw = lzma.decompress(r.content)
     ticks = []
     for i in range(0, len(raw) - 19, 20):
         ms, ask_r, bid_r, av, bv = struct.unpack(">IIIff", raw[i:i+20])
         ts = datetime(year, month, day, hour, tzinfo=timezone.utc) + timedelta(milliseconds=ms)
-        ticks.append({"ts": ts, "price": (ask_r+bid_r)/2/div, "ask_vol": float(av), "bid_vol": float(bv)})
+        ticks.append({
+            "ts": ts,
+            "price": (ask_r + bid_r) / 2 / div,
+            "ask_vol": float(av),
+            "bid_vol": float(bv),
+        })
     return ticks
 
-# ── Candle + footprint builder ───────────────────────────────────────────────
-def ticks_to_candles_with_footprint(ticks, tf_seconds=60, fp_levels=10):
-    """
-    Build OHLCV candles AND footprint data.
-    Footprint: for each candle, divide the price range into fp_levels buckets.
-    Each bucket stores {buy_vol, sell_vol, price_lo, price_hi}.
-    """
+# ── Simple candle builder (NO footprint — keeps main response small) ──────────
+def ticks_to_candles(ticks, tf_seconds=60):
     if not ticks: return []
     candles = {}
     for t in ticks:
@@ -76,38 +76,61 @@ def ticks_to_candles_with_footprint(ticks, tf_seconds=60, fp_levels=10):
         if b not in candles:
             candles[b] = {
                 "time": b, "open": t["price"], "high": t["price"],
-                "low": t["price"], "close": t["price"],
+                "low":  t["price"], "close": t["price"],
                 "volume": 0.0, "buy_vol": 0.0, "sell_vol": 0.0,
                 "session": get_session(b),
-                "_ticks": []  # raw ticks for footprint
             }
         c = candles[b]
-        c["high"]  = max(c["high"], t["price"])
-        c["low"]   = min(c["low"],  t["price"])
-        c["close"] = t["price"]
-        c["volume"]   += t["ask_vol"] + t["bid_vol"]
-        c["buy_vol"]  += t["ask_vol"]
-        c["sell_vol"] += t["bid_vol"]
+        c["high"]    = max(c["high"], t["price"])
+        c["low"]     = min(c["low"],  t["price"])
+        c["close"]   = t["price"]
+        c["volume"]  += t["ask_vol"] + t["bid_vol"]
+        c["buy_vol"] += t["ask_vol"]
+        c["sell_vol"]+= t["bid_vol"]
+    return sorted(candles.values(), key=lambda x: x["time"])
+
+# ── Footprint candle builder (used only by /api/footprint endpoint) ────────────
+def ticks_to_footprint_candles(ticks, tf_seconds=60, fp_levels=10):
+    """Build candles with per-price-level buy/sell split."""
+    if not ticks: return []
+    candles = {}
+    for t in ticks:
+        b = int(t["ts"].timestamp() // tf_seconds) * tf_seconds
+        if b not in candles:
+            candles[b] = {
+                "time": b, "open": t["price"], "high": t["price"],
+                "low":  t["price"], "close": t["price"],
+                "volume": 0.0, "buy_vol": 0.0, "sell_vol": 0.0,
+                "session": get_session(b),
+                "_ticks": [],
+            }
+        c = candles[b]
+        c["high"]    = max(c["high"], t["price"])
+        c["low"]     = min(c["low"],  t["price"])
+        c["close"]   = t["price"]
+        c["volume"]  += t["ask_vol"] + t["bid_vol"]
+        c["buy_vol"] += t["ask_vol"]
+        c["sell_vol"]+= t["bid_vol"]
         c["_ticks"].append(t)
 
     result = []
     for c in sorted(candles.values(), key=lambda x: x["time"]):
         rng = c["high"] - c["low"]
-        # Build footprint buckets
         footprint = []
-        if rng > 0:
-            bucket_size = rng / fp_levels
+        if rng > 1e-9:
+            bs = rng / fp_levels
             for lvl in range(fp_levels):
-                p_lo = c["low"] + lvl * bucket_size
-                p_hi = p_lo + bucket_size
-                p_mid = (p_lo + p_hi) / 2
+                p_lo = c["low"] + lvl * bs
+                p_hi = p_lo + bs
+                is_last = lvl == fp_levels - 1
                 bv = sv = 0.0
                 for t in c["_ticks"]:
-                    if p_lo <= t["price"] < p_hi:
+                    in_bucket = (p_lo <= t["price"] <= p_hi) if is_last else (p_lo <= t["price"] < p_hi)
+                    if in_bucket:
                         bv += t["ask_vol"]
                         sv += t["bid_vol"]
                 footprint.append({
-                    "price":    round(p_mid, 4),
+                    "price":    round((p_lo + p_hi) / 2, 4),
                     "price_lo": round(p_lo, 4),
                     "price_hi": round(p_hi, 4),
                     "buy_vol":  round(bv, 4),
@@ -120,178 +143,180 @@ def ticks_to_candles_with_footprint(ticks, tf_seconds=60, fp_levels=10):
         result.append(c)
     return result
 
-# ── Analysis functions ───────────────────────────────────────────────────────
+# ── Analysis pipeline ─────────────────────────────────────────────────────────
 def compute_volume_delta(candles):
-    cum = 0.0
-    out = []
+    cum, out = 0.0, []
     for c in candles:
         d = c["buy_vol"] - c["sell_vol"]
         cum += d
-        out.append({**c, "delta": round(d,4), "cum_delta": round(cum,4)})
+        out.append({**c, "delta": round(d, 4), "cum_delta": round(cum, 4)})
     return out
 
 def compute_volume_profile(candles, pip_size=0.5):
     profile = {}
     for c in candles:
-        lo = math.floor(c["low"]/pip_size)*pip_size
-        hi = math.floor(c["high"]/pip_size)*pip_size
-        n  = max(1, round((hi-lo)/pip_size)+1)
-        vpb = c["volume"]/n
+        lo = math.floor(c["low"] / pip_size) * pip_size
+        hi = math.floor(c["high"] / pip_size) * pip_size
+        n  = max(1, round((hi - lo) / pip_size) + 1)
+        vpb = c["volume"] / n
         p = lo
-        while p <= hi+0.001:
-            k = round(p,2); profile[k] = profile.get(k,0)+vpb; p=round(p+pip_size,2)
+        while p <= hi + 0.001:
+            k = round(p, 2)
+            profile[k] = profile.get(k, 0) + vpb
+            p = round(p + pip_size, 2)
     if not profile: return []
     mv = max(profile.values())
-    return [{"price":p,"volume":round(v,4),"pct":round(v/mv*100,1)} for p,v in sorted(profile.items())]
+    return [{"price": p, "volume": round(v, 4), "pct": round(v / mv * 100, 1)}
+            for p, v in sorted(profile.items())]
 
 def detect_volume_spikes(candles, window=20, mult=2.0):
     out = []
-    for i,c in enumerate(candles):
-        vols = [x["volume"] for x in candles[max(0,i-window):i]]
-        avg  = sum(vols)/len(vols) if vols else 0
-        spike= avg>0 and c["volume"]>mult*avg
-        out.append({**c,"avg_vol":round(avg,4),"is_spike":spike,
-                    "spike_ratio":round(c["volume"]/avg,2) if avg>0 else 0})
+    for i, c in enumerate(candles):
+        vols = [x["volume"] for x in candles[max(0, i - window):i]]
+        avg  = sum(vols) / len(vols) if vols else 0
+        spike = avg > 0 and c["volume"] > mult * avg
+        out.append({**c, "avg_vol": round(avg, 4), "is_spike": spike,
+                    "spike_ratio": round(c["volume"] / avg, 2) if avg > 0 else 0})
     return out
 
 def detect_delta_divergence(candles, lookback=5):
     out = []
-    for i,c in enumerate(candles):
-        div,strength=None,0.0
-        if i>=lookback:
-            w=candles[i-lookback:i+1]
-            pp=[x["close"] for x in w]; dp=[x["cum_delta"] for x in w]
-            php=max(pp[:-1]);phd=max(dp[:-1]);plp=min(pp[:-1]);pld=min(dp[:-1])
-            cp=c["close"];cd=c["cum_delta"]
-            if cp>php and cd<phd:
-                strength=round(min(100,((cp-php)/(php+1e-9)+(phd-cd)/(abs(phd)+1e-9))*50),1)
-                div="bearish"
-            elif cp<plp and cd>pld:
-                strength=round(min(100,((plp-cp)/(plp+1e-9)+(cd-pld)/(abs(pld)+1e-9))*50),1)
-                div="bullish"
-        out.append({**c,"divergence":div,"divergence_strength":strength})
+    for i, c in enumerate(candles):
+        div, strength = None, 0.0
+        if i >= lookback:
+            w  = candles[i - lookback:i + 1]
+            pp = [x["close"] for x in w]
+            dp = [x["cum_delta"] for x in w]
+            php, phd = max(pp[:-1]), max(dp[:-1])
+            plp, pld = min(pp[:-1]), min(dp[:-1])
+            cp, cd = c["close"], c["cum_delta"]
+            if cp > php and cd < phd:
+                strength = round(min(100, ((cp-php)/(php+1e-9) + (phd-cd)/(abs(phd)+1e-9)) * 50), 1)
+                div = "bearish"
+            elif cp < plp and cd > pld:
+                strength = round(min(100, ((plp-cp)/(plp+1e-9) + (cd-pld)/(abs(pld)+1e-9)) * 50), 1)
+                div = "bullish"
+        out.append({**c, "divergence": div, "divergence_strength": strength})
     return out
 
 def detect_absorption(candles, vw=20, vm=1.8, rt=0.35):
-    out=[]
-    for i,c in enumerate(candles):
-        ab=False
-        if i>=vw:
-            win=candles[i-vw:i]
-            av=sum(x["volume"] for x in win)/len(win)
-            ar=sum(x["high"]-x["low"] for x in win)/len(win)
-            ab=av>0 and c["volume"]>vm*av and ar>0 and (c["high"]-c["low"])<rt*ar
-        out.append({**c,"is_absorption":ab})
+    out = []
+    for i, c in enumerate(candles):
+        ab = False
+        if i >= vw:
+            win = candles[i - vw:i]
+            av = sum(x["volume"] for x in win) / len(win)
+            ar = sum(x["high"] - x["low"] for x in win) / len(win)
+            ab = av > 0 and c["volume"] > vm * av and ar > 0 and (c["high"] - c["low"]) < rt * ar
+        out.append({**c, "is_absorption": ab})
     return out
 
 def find_poc_and_value_area(profile, pct=0.70):
     if not profile: return {}
-    tv=sum(p["volume"] for p in profile)
-    poc=max(profile,key=lambda x:x["volume"])
-    sv=sorted(profile,key=lambda x:x["volume"],reverse=True)
-    cov,vp=0.0,[]
+    tv  = sum(p["volume"] for p in profile)
+    poc = max(profile, key=lambda x: x["volume"])
+    sv  = sorted(profile, key=lambda x: x["volume"], reverse=True)
+    cov, vp = 0.0, []
     for lvl in sv:
-        cov+=lvl["volume"]; vp.append(lvl["price"])
-        if cov>=tv*pct: break
-    return {"poc":poc["price"],"poc_volume":round(poc["volume"],4),
-            "vah":round(max(vp),2),"val":round(min(vp),2),"total_volume":round(tv,4)}
+        cov += lvl["volume"]; vp.append(lvl["price"])
+        if cov >= tv * pct: break
+    return {"poc": poc["price"], "poc_volume": round(poc["volume"], 4),
+            "vah": round(max(vp), 2), "val": round(min(vp), 2),
+            "total_volume": round(tv, 4)}
 
 def compute_session_stats(candles):
-    stats={}
+    stats = {}
     for c in candles:
-        s=c.get("session","off")
-        if s not in stats: stats[s]={"volume":0.0,"delta":0.0,"candles":0,"spikes":0}
-        stats[s]["volume"]+=c.get("volume",0); stats[s]["delta"]+=c.get("delta",0)
-        stats[s]["candles"]+=1
-        if c.get("is_spike"): stats[s]["spikes"]+=1
-    return {k:{x:round(v,4) if isinstance(v,float) else v for x,v in d.items()} for k,d in stats.items()}
+        s = c.get("session", "off")
+        if s not in stats: stats[s] = {"volume": 0.0, "delta": 0.0, "candles": 0, "spikes": 0}
+        stats[s]["volume"]  += c.get("volume", 0)
+        stats[s]["delta"]   += c.get("delta", 0)
+        stats[s]["candles"] += 1
+        if c.get("is_spike"): stats[s]["spikes"] += 1
+    return {k: {x: round(v, 4) if isinstance(v, float) else v for x, v in d.items()}
+            for k, d in stats.items()}
 
-def build_heatmap(candles, price_buckets=40):
-    """
-    Liquidity heatmap: for each candle+price bucket, total volume traded.
-    Returns list of {time, price, volume, pct} — normalised 0-100.
-    """
+def build_heatmap(candles, price_buckets=30):
+    """Liquidity heatmap: time × price bucket → volume intensity."""
     if not candles: return []
-    all_prices = [p for c in candles for p in [c["high"], c["low"]]]
-    min_p, max_p = min(all_prices), max(all_prices)
+    all_p = [p for c in candles for p in [c["high"], c["low"]]]
+    min_p, max_p = min(all_p), max(all_p)
     rng = max_p - min_p
-    if rng <= 0: return []
-    bucket_size = rng / price_buckets
+    if rng <= 1e-9: return []
+    bs = rng / price_buckets
     cells = {}
     for c in candles:
-        lo_b = int((c["low"]  - min_p) / bucket_size)
-        hi_b = int((c["high"] - min_p) / bucket_size)
+        lo_b = max(0, int((c["low"]  - min_p) / bs))
+        hi_b = min(price_buckets - 1, int((c["high"] - min_p) / bs))
         n = max(1, hi_b - lo_b + 1)
         vpb = c["volume"] / n
-        for b in range(lo_b, min(hi_b+1, price_buckets)):
+        for b in range(lo_b, hi_b + 1):
             key = (c["time"], b)
             cells[key] = cells.get(key, 0) + vpb
     if not cells: return []
     max_v = max(cells.values())
-    return [
-        {
-            "time":  t,
-            "price": round(min_p + b * bucket_size + bucket_size/2, 4),
-            "price_lo": round(min_p + b * bucket_size, 4),
-            "price_hi": round(min_p + (b+1) * bucket_size, 4),
-            "volume": round(v, 4),
-            "pct":   round(v / max_v * 100, 1),
-        }
-        for (t, b), v in cells.items()
-    ]
+    result = []
+    for (t, b), v in cells.items():
+        result.append({
+            "time":     t,
+            "price":    round(min_p + b * bs + bs / 2, 4),
+            "price_lo": round(min_p + b * bs, 4),
+            "price_hi": round(min_p + (b + 1) * bs, 4),
+            "volume":   round(v, 4),
+            "pct":      round(v / max_v * 100, 1),
+        })
+    return result
 
-# ── Correlation helper ────────────────────────────────────────────────────────
 def pearson_correlation(xs, ys):
     n = min(len(xs), len(ys))
     if n < 3: return 0.0
     xs, ys = xs[-n:], ys[-n:]
-    mx, my = sum(xs)/n, sum(ys)/n
-    num = sum((a-mx)*(b-my) for a,b in zip(xs,ys))
-    da  = math.sqrt(sum((a-mx)**2 for a in xs))
-    db  = math.sqrt(sum((b-my)**2 for b in ys))
-    if da==0 or db==0: return 0.0
-    return round(num/(da*db), 4)
+    mx, my = sum(xs) / n, sum(ys) / n
+    num = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+    da  = math.sqrt(sum((a - mx) ** 2 for a in xs))
+    db  = math.sqrt(sum((b - my) ** 2 for b in ys))
+    if da == 0 or db == 0: return 0.0
+    return round(num / (da * db), 4)
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status":"ok","time":datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
 @app.get("/api/orderflow/{symbol}")
 async def get_order_flow(
-    symbol: str,
-    hours_back: int = Query(default=3, ge=1, le=12),
-    timeframe:  int = Query(default=60),
-    spike_window: int = Query(default=20),
+    symbol:           str,
+    hours_back:       int   = Query(default=3, ge=1, le=12),
+    timeframe:        int   = Query(default=60),
+    spike_window:     int   = Query(default=20),
     spike_multiplier: float = Query(default=2.0),
     profile_pip_size: float = Query(default=0.5),
     divergence_lookback: int = Query(default=5),
-    footprint_levels: int = Query(default=10, ge=5, le=20),
-    include_heatmap: bool = Query(default=True),
 ):
     symbol = symbol.upper()
     if symbol not in INSTRUMENT_MAP:
         return {"error": f"Unknown symbol. Supported: {list(INSTRUMENT_MAP.keys())}"}
 
     duka_sym = INSTRUMENT_MAP[symbol]
-    hours = get_last_trading_hours(hours_back)
+    hours    = get_last_trading_hours(hours_back)
     all_ticks = []
 
     async def fh(args):
-        y,mo,d,hr=args
-        try: return await fetch_raw_ticks(duka_sym,y,mo,d,hr)
+        y, mo, d, hr = args
+        try: return await fetch_raw_ticks(duka_sym, y, mo, d, hr)
         except: return []
 
     for r in await asyncio.gather(*[fh(h) for h in hours]):
         all_ticks.extend(r)
-    all_ticks.sort(key=lambda x:x["ts"])
+    all_ticks.sort(key=lambda x: x["ts"])
 
     if not all_ticks:
-        return {"error":"No data found. Markets may be closed — try again Monday."}
+        return {"error": "No data found. Markets may be closed — try again Monday."}
 
-    now = datetime.now(timezone.utc)
-    # Full pipeline including footprint
-    candles = ticks_to_candles_with_footprint(all_ticks, tf_seconds=timeframe, fp_levels=footprint_levels)
+    now     = datetime.now(timezone.utc)
+    # Simple candles only — NO footprint stored here
+    candles = ticks_to_candles(all_ticks, tf_seconds=timeframe)
     candles = compute_volume_delta(candles)
     candles = detect_volume_spikes(candles, window=spike_window, multiplier=spike_multiplier)
     candles = detect_delta_divergence(candles, lookback=divergence_lookback)
@@ -300,87 +325,132 @@ async def get_order_flow(
     profile      = compute_volume_profile(candles, pip_size=profile_pip_size)
     poc_info     = find_poc_and_value_area(profile)
     sess_stats   = compute_session_stats(candles)
-    heatmap      = build_heatmap(candles) if include_heatmap else []
+    heatmap      = build_heatmap(candles)
 
-    spikes      = [c for c in candles if c["is_spike"]]
-    divs        = [c for c in candles if c["divergence"]]
-    absorbs     = [c for c in candles if c["is_absorption"]]
-    net_delta   = sum(c["delta"] for c in candles)
+    spikes  = [c for c in candles if c["is_spike"]]
+    divs    = [c for c in candles if c["divergence"]]
+    absorbs = [c for c in candles if c["is_absorption"]]
+    net_delta = sum(c["delta"] for c in candles)
 
     return {
-        "symbol": symbol, "generated_at": now.isoformat(),
-        "candle_count": len(candles), "timeframe_seconds": timeframe,
-        "data_from": "last trading session (weekend-aware)",
+        "symbol":          symbol,
+        "generated_at":    now.isoformat(),
+        "candle_count":    len(candles),
+        "timeframe_seconds": timeframe,
+        "data_from":       "last trading session (weekend-aware)",
         "summary": {
-            "net_delta": round(net_delta,4),
-            "bias": "bullish" if net_delta>0 else "bearish",
-            "spike_count": len(spikes),
+            "net_delta":        round(net_delta, 4),
+            "bias":             "bullish" if net_delta > 0 else "bearish",
+            "spike_count":      len(spikes),
             "divergence_count": len(divs),
             "absorption_count": len(absorbs),
-            "last_price": candles[-1]["close"] if candles else None,
+            "last_price":       candles[-1]["close"] if candles else None,
             **poc_info,
         },
-        "session_stats": sess_stats,
-        "candles":       candles,
+        "session_stats":  sess_stats,
+        "candles":        candles,
         "volume_profile": profile,
-        "heatmap":       heatmap,
+        "heatmap":        heatmap,
     }
+
+
+@app.get("/api/footprint/{symbol}")
+async def get_footprint(
+    symbol:      str,
+    hours_back:  int = Query(default=2, ge=1, le=6),
+    timeframe:   int = Query(default=60),
+    fp_levels:   int = Query(default=10, ge=5, le=20),
+    num_candles: int = Query(default=30, ge=5, le=60),
+):
+    """Dedicated endpoint for footprint data — fetches only last N candles."""
+    symbol = symbol.upper()
+    if symbol not in INSTRUMENT_MAP:
+        return {"error": "Unknown symbol"}
+
+    duka_sym  = INSTRUMENT_MAP[symbol]
+    hours     = get_last_trading_hours(hours_back)
+    all_ticks = []
+
+    async def fh(args):
+        y, mo, d, hr = args
+        try: return await fetch_raw_ticks(duka_sym, y, mo, d, hr)
+        except: return []
+
+    for r in await asyncio.gather(*[fh(h) for h in hours]):
+        all_ticks.extend(r)
+    all_ticks.sort(key=lambda x: x["ts"])
+
+    if not all_ticks:
+        return {"error": "No data found"}
+
+    all_candles = ticks_to_footprint_candles(all_ticks, tf_seconds=timeframe, fp_levels=fp_levels)
+    recent      = all_candles[-num_candles:]
+
+    return {
+        "symbol":       symbol,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "candles": [{
+            "time":      c["time"],
+            "open":      c["open"],
+            "high":      c["high"],
+            "low":       c["low"],
+            "close":     c["close"],
+            "volume":    round(c["volume"], 4),
+            "buy_vol":   round(c["buy_vol"], 4),
+            "sell_vol":  round(c["sell_vol"], 4),
+            "session":   c.get("session", "off"),
+            "footprint": c.get("footprint", []),
+        } for c in recent],
+    }
+
 
 @app.get("/api/correlation")
 async def get_correlation(
     hours_back: int = Query(default=3, ge=1, le=6),
-    timeframe:  int = Query(default=300),  # 5m default for correlation
+    timeframe:  int = Query(default=300),
 ):
-    """
-    Fetch last N hours of closes for all symbols in parallel,
-    compute pairwise Pearson correlation matrix.
-    """
     symbols = list(INSTRUMENT_MAP.keys())
     hours   = get_last_trading_hours(hours_back)
 
-    async def fetch_symbol_closes(sym):
+    async def fetch_closes(sym):
         duka = INSTRUMENT_MAP[sym]
         ticks = []
         async def fh(args):
-            y,mo,d,hr=args
-            try: return await fetch_raw_ticks(duka,y,mo,d,hr)
+            y, mo, d, hr = args
+            try: return await fetch_raw_ticks(duka, y, mo, d, hr)
             except: return []
         for r in await asyncio.gather(*[fh(h) for h in hours]):
             ticks.extend(r)
-        ticks.sort(key=lambda x:x["ts"])
+        ticks.sort(key=lambda x: x["ts"])
         if not ticks: return sym, []
-        candles = ticks_to_candles_with_footprint(ticks, tf_seconds=timeframe, fp_levels=2)
+        candles = ticks_to_candles(ticks, tf_seconds=timeframe)
         return sym, [c["close"] for c in candles]
 
-    results = await asyncio.gather(*[fetch_symbol_closes(s) for s in symbols])
+    results = await asyncio.gather(*[fetch_closes(s) for s in symbols])
     closes  = dict(results)
 
-    # Build N×N correlation matrix
     matrix = {}
     for s1 in symbols:
         matrix[s1] = {}
         for s2 in symbols:
-            if s1 == s2:
-                matrix[s1][s2] = 1.0
+            if s1 == s2: matrix[s1][s2] = 1.0
             elif closes.get(s1) and closes.get(s2):
                 matrix[s1][s2] = pearson_correlation(closes[s1], closes[s2])
-            else:
-                matrix[s1][s2] = None
-
-    # Last price per symbol
-    last_prices = {s: closes[s][-1] if closes.get(s) else None for s in symbols}
+            else: matrix[s1][s2] = None
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "symbols":      symbols,
         "matrix":       matrix,
-        "last_prices":  last_prices,
+        "last_prices":  {s: closes[s][-1] if closes.get(s) else None for s in symbols},
         "hours_back":   hours_back,
     }
+
 
 @app.get("/api/symbols")
 async def list_symbols():
     return {"symbols": list(INSTRUMENT_MAP.keys())}
+
 
 if __name__ == "__main__":
     import uvicorn
