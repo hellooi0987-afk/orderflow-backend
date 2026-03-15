@@ -92,12 +92,13 @@ def build_footprint(ticks, tf, pip_size=0.5):
         # Compute delta per level and find dominant
         max_vol = 0.0
         for pl,lv in levels.items():
-            lv["delta"] = round(lv["buy"]-lv["sell"],4)
-            lv["buy"]   = round(lv["buy"],4)
-            lv["sell"]  = round(lv["sell"],4)
+            lv["delta"] = round(lv["buy"]-lv["sell"],6)
+            lv["buy"]   = round(lv["buy"],6)
+            lv["sell"]  = round(lv["sell"],6)
             max_vol = max(max_vol, lv["buy"]+lv["sell"])
         # Convert to sorted list for serialisation
-        lvl_list = [{"price":pl,"buy":lv["buy"],"sell":lv["sell"],"delta":lv["delta"],
+        lvl_list = [{"price":pl,"buy":round(lv["buy"],6),"sell":round(lv["sell"],6),
+                     "delta":round(lv["delta"],6),
                      "pct":round((lv["buy"]+lv["sell"])/max_vol*100,1) if max_vol>0 else 0}
                     for pl,lv in sorted(levels.items())]
         result.append({"time":b,"levels":lvl_list,"max_vol":round(max_vol,4)})
