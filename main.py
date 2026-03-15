@@ -19,10 +19,27 @@ app.add_middleware(
 DUKA_BASE = "https://datafeed.dukascopy.com/datafeed"
 
 INSTRUMENT_MAP = {
-    "XAUUSD": "XAUUSD",
-    "EURUSD": "EURUSD",
-    "GBPUSD": "GBPUSD",
-    "USDJPY": "USDJPY",
+    "XAUUSD":    "XAUUSD",
+    "XAGUSD":    "XAGUSD",
+    "USOUSD":    "USOUSD",
+    "NATGASUSD": "NATGASUSD",
+    "EURUSD":    "EURUSD",
+    "GBPUSD":    "GBPUSD",
+    "USDJPY":    "USDJPY",
+    "BTCUSD":    "BTCUSD",
+    "SPXUSD":    "SPXUSD",
+}
+
+DIVISORS = {
+    "XAUUSD":    1000.0,
+    "XAGUSD":    1000.0,
+    "USOUSD":    1000.0,
+    "NATGASUSD": 10000.0,
+    "EURUSD":    100000.0,
+    "GBPUSD":    100000.0,
+    "USDJPY":    1000.0,
+    "BTCUSD":    1.0,
+    "SPXUSD":    1000.0,
 }
 
 
@@ -52,7 +69,7 @@ async def fetch_dukascopy_candles(symbol, year, month, day, hour):
         chunk = raw[i:i + tick_size]
         ms_offset, ask_raw, bid_raw, ask_vol, bid_vol = struct.unpack(">IIIff", chunk)
         ts = datetime(year, month, day, hour, tzinfo=timezone.utc) + timedelta(milliseconds=ms_offset)
-        divisor = 1000.0 if symbol == "XAUUSD" else 100000.0
+        divisor = DIVISORS.get(symbol, 100000.0)
         mid = (ask_raw + bid_raw) / 2 / divisor
         ticks.append({
             "ts": ts,
